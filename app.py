@@ -20,7 +20,7 @@ import time
 import cv2
 import numpy as np
 from fastapi.responses import StreamingResponse
-from nicegui import app, run, ui
+from nicegui import app, background_tasks, run, ui
 
 try:
     import snap7
@@ -71,6 +71,7 @@ LIGHT_GROUPS = {
     ]),
 }
 DEFAULT_MODE = "toggle"
+PULSE_SECONDS = 0.2
 
 # Fari: variabile INT (DB, byte) = minuti di accensione. Il PLC fa il resto.
 # Ogni pressione aggiunge FARI_STEP minuti (max FARI_MAX).
@@ -108,11 +109,33 @@ CAMERAS = [
     ("Garage",   4),
 ]
 CAM_W, CAM_H, CAM_FPS = 640, 480, 8
+VIEW_TIMEOUT = 10   # la webcam si ferma se nessuno la guarda da questi secondi
 # =====================================================================
 
 
 # ------------------------------- PLC ---------------------------------
+def _build_ranges():
+    """Per ogni DB calcola l'intervallo di byte da leggere con UNA sola richiesta."""
+    r = {}
+
+    def add(db, start, size):
+        lo, hi = r.get(db, (start, start + size))
+        r[db] = (min(lo, start), max(hi, start + size))
+
+    for _, (_, items) in LIGHT_GROUPS.items():
+        for _, _, cfg in items:
+            add(cfg["read"][0], cfg["read"][1], 1)
+    for _, (db, byte) in FARI:
+        add(db, byte, 2)
+    return {db: (lo, hi - lo) for db, (lo, hi) in r.items()}
+
+
+READ_RANGES = _build_ranges()
+
+
 class PLC:
+    poll_ms = 0
+
     def __init__(self):
         self.lock = threading.Lock()
         self.client = snap7.client.Client() if snap7 else None
@@ -152,11 +175,18 @@ class PLC:
                 self._mark_unknown()
                 return
             try:
+                t0 = time.time()
+                blocks = {db: (start, self.client.db_read(db, start, size))
+                          for db, (start, size) in READ_RANGES.items()}
                 for _, (_, items) in LIGHT_GROUPS.items():
                     for name, _, cfg in items:
-                        self.lights[name] = self._read_bit(cfg["read"])
+                        db, byte, bit = cfg["read"]
+                        start, data = blocks[db]
+                        self.lights[name] = get_bool(data, byte - start, bit)
                 for name, (db, byte) in FARI:
-                    self.fari[name] = get_int(self.client.db_read(db, byte, 2), 0)
+                    start, data = blocks[db]
+                    self.fari[name] = get_int(data, byte - start)
+                self.poll_ms = int((time.time() - t0) * 1000)
             except Exception as e:
                 log.warning("Errore lettura PLC: %s", e)
                 self.connected = False
@@ -168,26 +198,48 @@ class PLC:
         for k in list(self.fari):
             self.fari[k] = None
 
+    def _write_bits(self, addrs, value):
+        """Scrive più bit raggruppando per byte: una sola lettura+scrittura per byte."""
+        groups = {}
+        for db, byte, bit in addrs:
+            groups.setdefault((db, byte), []).append(bit)
+        for (db, byte), bits in groups.items():
+            data = self.client.db_read(db, byte, 1)
+            for b in bits:
+                set_bool(data, 0, b, value)
+            self.client.db_write(db, byte, data)
+
+    def _pulse(self, addrs):
+        """Impulso su uno o più bit. Il lock NON è tenuto durante l'attesa."""
+        try:
+            with self.lock:
+                if not self.connected and not self._connect():
+                    return False
+                self._write_bits(addrs, True)
+            time.sleep(PULSE_SECONDS)
+            with self.lock:
+                self._write_bits(addrs, False)
+            return True
+        except Exception as e:
+            log.warning("Errore impulso PLC: %s", e)
+            self.connected = False
+            return False
+
     def press_light(self, name, cfg):
+        if cfg.get("mode", DEFAULT_MODE) != "toggle":
+            return self._pulse([cfg["write"]])
         with self.lock:
             if not self.connected and not self._connect():
                 return False
             try:
-                mode = cfg.get("mode", DEFAULT_MODE)
-                if mode == "toggle":
-                    state = self._read_bit(cfg["read"])
-                    self._write_bit(cfg["write"], not state)
-                else:
-                    self._write_bit(cfg["write"], True)
-                    time.sleep(0.3)
-                    self._write_bit(cfg["write"], False)
+                self._write_bit(cfg["write"], not self._read_bit(cfg["read"]))
                 return True
             except Exception as e:
                 log.warning("Errore scrittura PLC: %s", e)
                 self.connected = False
                 return False
 
-    def run_scene(self, scene):
+    def _scene_plan(self, scene):
         """Esegue una scena. Ritorna il numero di azioni fatte, o None se PLC offline."""
         with self.lock:
             if not self.connected and not self._connect():
@@ -218,18 +270,20 @@ class PLC:
                 if scene.get("plc_bit"):
                     pulse_bits.append(scene["plc_bit"])
 
-                # tutti gli impulsi insieme: una sola attesa per l'intera scena
-                for addr in pulse_bits:
-                    self._write_bit(addr, True)
-                if pulse_bits:
-                    time.sleep(SCENE_PULSE_SECONDS)
-                    for addr in pulse_bits:
-                        self._write_bit(addr, False)
-                return len(pulse_bits)
+                return pulse_bits
             except Exception as e:
                 log.warning("Errore scena: %s", e)
                 self.connected = False
                 return None
+
+    def run_scene(self, scene):
+        """Esegue una scena. Ritorna il numero di impulsi, o None se PLC offline."""
+        pulses = self._scene_plan(scene)
+        if pulses is None:
+            return None
+        if pulses and not self._pulse(pulses):
+            return None
+        return len(pulses)
 
     def add_faro_time(self, name, db, byte, delta):
         """delta > 0 aggiunge minuti, delta == 0 azzera."""
@@ -266,11 +320,20 @@ class Camera(threading.Thread):
         self.name, self.index = name, index
         self.jpeg = _placeholder("Non disponibile")
         self.online = False
+        self.last_view = 0.0
 
     def run(self):
         cap = None
         while True:
             try:
+                if time.time() - self.last_view > VIEW_TIMEOUT:
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+                        self.jpeg = _placeholder("Avvio...")
+                    self.online = False
+                    time.sleep(0.3)
+                    continue
                 if cap is None or not cap.isOpened():
                     self.online = False
                     self.jpeg = _placeholder("Non disponibile")
@@ -314,6 +377,7 @@ async def video(cam_id: int):
     async def gen():
         cam = cameras[cam_id]
         while True:
+            cam.last_view = time.time()
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + cam.jpeg + b"\r\n"
             await asyncio.sleep(1 / CAM_FPS)
 
@@ -321,6 +385,31 @@ async def video(cam_id: int):
 
 
 # --------------------------------- UI --------------------------------
+pending = {}      # stato "ottimistico" subito dopo un click: nome -> (valore, scadenza)
+poll_now = None   # evento per forzare una lettura veloce dopo un'azione
+
+
+async def poll_loop():
+    """Un solo ciclo di lettura per tutta l'app, indipendente dai browser aperti."""
+    while True:
+        await run.io_bound(plc.poll)
+        delay = POLL_SECONDS if plc.connected else 3.0
+        try:
+            await asyncio.wait_for(poll_now.wait(), delay)
+            poll_now.clear()
+            await asyncio.sleep(0.15)   # tempo al PLC per aggiornare i bit di stato
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _start():
+    global poll_now
+    poll_now = asyncio.Event()
+    background_tasks.create(poll_loop())
+
+
+app.on_startup(_start)
+
 ON_COLOR, OFF_COLOR, UNK_COLOR = "amber-6", "blue-grey-8", "red-10"
 
 
@@ -341,16 +430,21 @@ def main_page():
         plc_badge = ui.badge("PLC ...").props("rounded")
 
     async def on_light(name, cfg):
+        cur = plc.lights.get(name)
+        if cur is not None:   # aggiorna subito il colore, senza aspettare il PLC
+            pending[name] = (not cur, time.time() + 2.5)
+            apply_state()
         ok = await run.io_bound(plc.press_light, name, cfg)
         if not ok:
+            pending.pop(name, None)
             ui.notify("PLC non raggiungibile", type="negative")
-        await refresh()
+        poll_now.set()
 
     async def on_faro(name, db, byte, delta):
         ok = await run.io_bound(plc.add_faro_time, name, db, byte, delta)
         if not ok:
             ui.notify("PLC non raggiungibile", type="negative")
-        await refresh()
+        poll_now.set()
 
     async def on_scene(scene):
         res = await run.io_bound(plc.run_scene, scene)
@@ -358,7 +452,7 @@ def main_page():
             ui.notify("PLC non raggiungibile", type="negative")
         else:
             ui.notify(f"Scena «{scene['name']}» eseguita", type="positive")
-        await refresh()
+        poll_now.set()
 
     with ui.tabs().classes("w-full") as tabs:
         t_luci = ui.tab("Luci", icon="lightbulb")
@@ -417,22 +511,36 @@ def main_page():
                 for i, cam in enumerate(cameras):
                     with ui.card().classes("w-full p-2"):
                         ui.label(cam.name).classes("font-semibold")
-                        ui.interactive_image(f"/video/{i}").classes("w-full")
+                        ui.image(f"/video/{i}").classes("w-full")
 
-    async def refresh():
-        await run.io_bound(plc.poll)
-        plc_badge.text = "PLC online" if plc.connected else "PLC offline"
-        plc_badge.props(f"color={'green' if plc.connected else 'red'}")
-        for name, (btn, icon) in light_buttons.items():
+    last = {}
+
+    def apply_state():
+        """Applica alla pagina i dati in cache: nessun accesso al PLC, quindi istantanea."""
+        txt = f"PLC online · {plc.poll_ms} ms" if plc.connected else "PLC offline"
+        if last.get("badge") != txt:
+            last["badge"] = txt
+            plc_badge.text = txt
+            plc_badge.props(f"color={'green' if plc.connected else 'red'}")
+        now = time.time()
+        for name, (btn, _) in light_buttons.items():
             st = plc.lights.get(name)
-            color = UNK_COLOR if st is None else (ON_COLOR if st else OFF_COLOR)
-            btn.props(f"color={color}")
-            btn.props(f"icon={icon}")
+            p = pending.get(name)
+            if p:
+                if st == p[0] or now > p[1]:
+                    pending.pop(name, None)
+                else:
+                    st = p[0]
+            if last.get(name, "?") != st:
+                last[name] = st
+                btn.props(f"color={UNK_COLOR if st is None else (ON_COLOR if st else OFF_COLOR)}")
         for name, lbl in faro_labels.items():
             v = plc.fari.get(name)
-            lbl.text = "--" if v is None else (f"{v} min" if v > 0 else "Spento")
+            t = "--" if v is None else (f"{v} min" if v > 0 else "Spento")
+            if lbl.text != t:
+                lbl.text = t
 
-    ui.timer(POLL_SECONDS, refresh)
+    ui.timer(0.3, apply_state)
 
 
 ui.run(host="0.0.0.0", port=PORT, title="Casa", dark=True, reload=False, show=False)
