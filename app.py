@@ -90,11 +90,11 @@ FARI_STEP, FARI_MAX = 1, 60
 #   plc_bit : (DB, byte, bit) -> impulso su un bit del PLC (la logica la fa il PLC)
 # I nomi in on/off devono coincidere con quelli di LIGHT_GROUPS.
 SCENES = [
-    dict(name="Spegni tutto", icon="power_settings_new", color="red-8", all_off=True),
+    dict(name="Spegni tutto", icon="power_settings_new", color="red-8", plc_bit=(110, 0, 0)),
     dict(name="Sera", icon="nights_stay", color="indigo-7",
-         on=["Luce sala 1", "Luce corridoio"], off=["Luce cucina", "Luce sala 2"]),
+         on=["Luce sala 1", "Luce corridoio"]),
     dict(name="Cena", icon="restaurant", color="orange-9",
-         on=["Luce cucina", "Luce sala 2"], off=["Luce sala", "Luce sala 1"]),
+         on=["Luce cucina", "Luce sala 2"]),
     dict(name="Notte", icon="bedtime", color="deep-purple-8", plc_bit=(1, 5, 0)),
     dict(name="Garage", icon="garage", color="teal-8",
          on=["Luce garage", "Luce banco garage"]),
