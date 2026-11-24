@@ -314,10 +314,16 @@ def _placeholder(text):
     return cv2.imencode(".jpg", img)[1].tobytes()
 
 
+IP_RASPBERRY = "192.168.1.32"
+CAMERAS = [
+    ("Telecamera 1", f"rtsp://{IP_RASPBERRY}:8554/cam1"),
+    ("Telecamera 2", f"rtsp://{IP_RASPBERRY}:8554/cam2"),
+]
+
 class Camera(threading.Thread):
-    def __init__(self, name, index):
+    def __init__(self, name, source):
         super().__init__(daemon=True)
-        self.name, self.index = name, index
+        self.name, self.source = name, source
         self.jpeg = _placeholder("Non disponibile")
         self.online = False
         self.last_view = 0.0
@@ -334,26 +340,35 @@ class Camera(threading.Thread):
                     self.online = False
                     time.sleep(0.3)
                     continue
+
                 if cap is None or not cap.isOpened():
                     self.online = False
-                    self.jpeg = _placeholder("Non disponibile")
-                    cap = cv2.VideoCapture(self.index, cv2.CAP_V4L2)
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+                    self.jpeg = _placeholder("Connessione...")
+                    # Usa CAP_FFMPEG e riduci il buffer a 1 per minimizzare la latenza
+                    cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     if not cap.isOpened():
                         cap.release()
                         cap = None
                         time.sleep(5)
                         continue
+
                 ok, frame = cap.read()
                 if not ok:
                     cap.release()
                     cap = None
                     time.sleep(2)
                     continue
+
+                # Ridimensiona il frame alle dimensioni desiderate CAM_W x CAM_H
+                if frame.shape[1] != CAM_W or frame.shape[0] != CAM_H:
+                    frame = cv2.resize(frame, (CAM_W, CAM_H))
+
                 self.jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
                 self.online = True
-                time.sleep(1 / CAM_FPS)
+                # Nota: non serve time.sleep(1 / CAM_FPS) perché cap.read() 
+                # è già sincronizzato con gli FPS in arrivo dal Raspberry. 
+                # Togliendolo svuoti il buffer più in fretta e abbatti la latenza!
             except Exception as e:
                 log.warning("Camera %s: %s", self.name, e)
                 try:
@@ -364,24 +379,10 @@ class Camera(threading.Thread):
                 time.sleep(5)
 
 
-cameras = [Camera(n, i) for n, i in CAMERAS]
+cameras = [Camera(n, s) for n, s in CAMERAS]
 for c in cameras:
     c.start()
 
-
-@app.get("/video/{cam_id}")
-async def video(cam_id: int):
-    if not 0 <= cam_id < len(cameras):
-        return StreamingResponse(iter([]), status_code=404)
-
-    async def gen():
-        cam = cameras[cam_id]
-        while True:
-            cam.last_view = time.time()
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + cam.jpeg + b"\r\n"
-            await asyncio.sleep(1 / CAM_FPS)
-
-    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 # --------------------------------- UI --------------------------------
