@@ -389,6 +389,25 @@ for c in cameras:
     c.start()
     time.sleep(0.5)
 
+@app.get("/video/{idx}")
+async def video_feed(idx: int):
+    if idx < 0 or idx >= len(cameras):
+        return StreamingResponse(iter([]), status_code=404)
+    cam = cameras[idx]
+
+    async def stream():
+        while True:
+            cam.last_view = time.time()
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + cam.jpeg + b"\r\n"
+            )
+            await asyncio.sleep(1 / CAM_FPS)
+
+    return StreamingResponse(
+        stream(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 # --------------------------------- UI --------------------------------
@@ -514,11 +533,20 @@ def main_page():
         with ui.tab_panel(t_cam):
             if not cameras:
                 ui.label("Nessuna telecamera configurata")
+            cam_imgs = []
             with ui.grid(columns=1).classes("w-full gap-3 md:grid-cols-2"):
                 for i, cam in enumerate(cameras):
                     with ui.card().classes("w-full p-2"):
                         ui.label(cam.name).classes("font-semibold")
-                        ui.image(f"/video/{i}").classes("w-full")
+                        img = ui.image("").classes("w-full")
+                        cam_imgs.append((img, f"/video/{i}"))
+
+            def on_tab_change(e):
+                active = (e.value == "Camere")
+                for img, url in cam_imgs:
+                    img.set_source(url if active else "")
+
+            tabs.on_value_change(on_tab_change)
 
     last = {}
 
