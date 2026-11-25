@@ -17,10 +17,14 @@ import logging
 import threading
 import time
 
-import cv2
 import numpy as np
 from fastapi.responses import StreamingResponse
 from nicegui import app, background_tasks, run, ui
+import os
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp;stimeout;3000000;rw_timeout;3000000"
+
+import cv2
+
 
 try:
     import snap7
@@ -53,6 +57,7 @@ LIGHT_GROUPS = {
         ("Luce sala 2",   "chair",      dict(write=(4, 2, 6), read=(4, 2, 6))),
         ("Luce cucina",   "kitchen",    dict(write=(4, 2, 4), read=(4, 2, 4))),
         ("Luce corridoio", "meeting_room", dict(write=(5, 1, 0), read=(5, 1, 0))),
+        ("Luce tv", "tv", dict(write=(5, 1, 0), read=(5, 1, 0))),
     ]),
     "Zona notte": ("bed", [
         ("Luce camera sx", "bed",       dict(write=(3, 1, 0), read=(3, 1, 0))),
@@ -382,6 +387,7 @@ class Camera(threading.Thread):
 cameras = [Camera(n, s) for n, s in CAMERAS]
 for c in cameras:
     c.start()
+    time.sleep(0.5)
 
 
 
