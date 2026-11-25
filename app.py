@@ -21,7 +21,7 @@ import numpy as np
 from fastapi.responses import StreamingResponse
 from nicegui import app, background_tasks, run, ui
 import os
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp;stimeout;3000000;rw_timeout;3000000"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 import cv2
 
@@ -349,8 +349,11 @@ class Camera(threading.Thread):
                 if cap is None or not cap.isOpened():
                     self.online = False
                     self.jpeg = _placeholder("Connessione...")
-                    # Usa CAP_FFMPEG e riduci il buffer a 1 per minimizzare la latenza
-                    cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+                    cap = cv2.VideoCapture(
+                        self.source, cv2.CAP_FFMPEG,
+                        [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+                         cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000],
+                    )
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     if not cap.isOpened():
                         cap.release()
@@ -365,15 +368,11 @@ class Camera(threading.Thread):
                     time.sleep(2)
                     continue
 
-                # Ridimensiona il frame alle dimensioni desiderate CAM_W x CAM_H
                 if frame.shape[1] != CAM_W or frame.shape[0] != CAM_H:
                     frame = cv2.resize(frame, (CAM_W, CAM_H))
 
                 self.jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
                 self.online = True
-                # Nota: non serve time.sleep(1 / CAM_FPS) perché cap.read() 
-                # è già sincronizzato con gli FPS in arrivo dal Raspberry. 
-                # Togliendolo svuoti il buffer più in fretta e abbatti la latenza!
             except Exception as e:
                 log.warning("Camera %s: %s", self.name, e)
                 try:
